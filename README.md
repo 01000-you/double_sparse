@@ -1,3 +1,7 @@
+# Double sparse pruning
+
+Code for the ICLR 2025 paper: [Two Sparse Matrices are Better than One: Sparsifying Neural Networks with Double Sparse Factorization](https://openreview.net/forum?id=DwiwOcK1B7).
+
 The repository is based on [SparseGPT](https://github.com/IST-DASLab/sparsegpt) code 
 
 ## Dependencies

@@ -11,6 +11,7 @@ MLP + Attention 모두 적용 (2SSP와 동일)
 import time
 import torch
 import torch.nn as nn
+import doublesparse_2ssp
 from doublesparse_2ssp import (
     DoubleSparse2SSP,
     initial_factorize,
@@ -26,9 +27,18 @@ except ImportError:
     has_wandb = False
 
 
-def log_time(message):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    print(f"[{timestamp}] {message}")
+def log_time(message, level=0):
+    """level: 0=메인, 1=서브, 2=디테일"""
+    timestamp = time.strftime("%H:%M:%S", time.localtime())
+    prefix = "  " * level
+    print(f"[{timestamp}] {prefix}{message}")
+
+
+def log_section(title):
+    """섹션 구분용 헤더"""
+    print(f"\n{'='*60}")
+    print(f"  {title}")
+    print(f"{'='*60}")
 
 
 def get_qwen3(model):
@@ -263,14 +273,17 @@ def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
 
 
 @torch.no_grad()
-def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, target_compression=None):
+def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, target_compression=None, verbose=False):
     """
     프로세스:
     1. W를 AB로 초기 분해 (채널 제약 없음)
     2. 2SSP로 AB 사이 어떤 채널 reduction할지 결정
     3. ADMM으로 채널 마스크 고정 후 최적화
     """
-    log_time("Starting Qwen3 2SSP+DoubleSparse (AB분해 -> 2SSP채널선택 -> ADMM)")
+    doublesparse_2ssp.VERBOSE = verbose
+
+    log_section("Qwen3 2SSP + Double Sparse")
+    log_time("AB분해 → 2SSP 채널선택 → ADMM")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -288,7 +301,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     cache = {"i": 0, "attention_mask": None, "position_embeddings": None,
              "position_ids": None, "cache_position": None}
 
-    log_time("Phase 0: Catching inputs...")
+    log_section("Phase 0: Calibration 입력 수집")
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -328,6 +341,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     if not calibration_batches:
         raise RuntimeError("No calibration data captured")
     calibration_input_ids = torch.cat(calibration_batches, dim=1)
+    log_time(f"캘리브레이션 토큰: {calibration_input_ids.shape[1]} 개", 1)
     if calibration_input_ids.size(0) > 1:
         calibration_input_ids = calibration_input_ids[0:1]
 
@@ -345,15 +359,18 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
         num_keep_mlp, num_keep_attn = compute_num_keep_from_target_compression(
             target_compression, hidden_size, intermediate_size
         )
-        log_time(f"Target compression {target_compression:.0%} -> num_keep MLP={num_keep_mlp}/{intermediate_size}, Attn={num_keep_attn}/{hidden_size}")
+        log_time(f"목표 압축 {target_compression:.0%} → MLP {num_keep_mlp}/{intermediate_size}, Attn {num_keep_attn}/{hidden_size}", 1)
     else:
         num_keep_mlp = max(1, int(intermediate_size * (1 - channel_reduction_ratio)))
         num_keep_attn = max(1, int(hidden_size * (1 - channel_reduction_ratio)))
 
-    log_time("Phase 1: Initial AB factorization (all layers)...")
+    log_section("Phase 1: W → A@B 초기 분해")
+    log_time(f"레이어 {num_layers}개, dense 분해", 1)
+    t_phase1 = time.time()
     outs = torch.zeros_like(inps)
     for i in range(num_layers):
-        log_time(f"  Layer {i}: Initial AB factorization...")
+        if (i + 1) % 4 == 0 or i == 0 or i == num_layers - 1:
+            log_time(f"Layer {i+1}/{num_layers}...", 1)
         layer = layers[i].to(dev)
         full = find_layers(layer)
 
@@ -404,7 +421,8 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
                     continue
                 W = subset[name].weight.data.clone().float()
                 H = gpts[name].H
-                W_ab = initial_factorize(W, H)
+                layer_name = f"layer{i}.{name}"
+                W_ab = initial_factorize(W, H, verbose=verbose, name=layer_name)
                 subset[name].weight.data = W_ab.reshape(subset[name].weight.shape).to(subset[name].weight.dtype)
                 gpts[name].free()
 
@@ -414,7 +432,11 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    log_time("Phase 2: 2SSP channel importance (layer-by-layer, OOM 방지)...")
+    log_time(f"Phase 1 완료 ({time.time()-t_phase1:.1f}s)", 1)
+
+    log_section("Phase 2: 채널 중요도 (2SSP)")
+    log_time("레이어별 순차 forward (OOM 방지)", 1)
+    t_phase2 = time.time()
     mlp_norms, attn_norms = _get_channel_importance_2ssp(
         model, calibration_input_ids, num_layers,
         intermediate_size, hidden_size, seqlen, dev
@@ -423,9 +445,10 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     channel_masks_mlp = {li: get_channel_keep_mask(mlp_norms[li], num_keep_mlp) for li in range(num_layers)}
     channel_masks_attn = {li: get_channel_keep_mask(attn_norms[li], num_keep_attn) for li in range(num_layers)}
 
-    log_time(f"Channel reduction: MLP {intermediate_size}->{num_keep_mlp}, Attn {hidden_size}->{num_keep_attn}")
+    log_time(f"Phase 2 완료 ({time.time()-t_phase2:.1f}s) | MLP {intermediate_size}→{num_keep_mlp}, Attn {hidden_size}→{num_keep_attn}", 1)
 
-    log_time("Phase 3: ADMM with channel mask...")
+    log_section("Phase 3: ADMM (채널 마스크 고정)")
+    t_phase3 = time.time()
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     inps = torch.zeros((args.nsamples, model.seqlen, hidden_size), dtype=dtype, device=dev)
     layers[0] = Catcher(layers[0])
@@ -442,7 +465,8 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
 
     outs = torch.zeros_like(inps)
     for i in range(num_layers):
-        log_time(f"  Layer {i}: ADMM with channel mask...")
+        if (i + 1) % 4 == 0 or i == 0 or i == num_layers - 1:
+            log_time(f"Layer {i+1}/{num_layers}...", 1)
         layer = layers[i].to(dev)
         full = find_layers(layer)
 
@@ -501,7 +525,8 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
 
             for name in subset:
                 if name in gpts:
-                    log_time(f"    Pruning {name}...")
+                    if verbose:
+                        log_time(f"Pruning {name}...", 2)
                     gpts[name].fasterprune()
                     gpts[name].free()
 
@@ -521,7 +546,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     )
     if total_w > 0:
         actual_ratio = total_ab_saved / total_w
-        log_time(f"[Compression] W total: {total_w:,} | A+B saved: {total_ab_saved:,} | ratio: {actual_ratio:.2%}")
+        log_time(f"W: {total_w:,} → A+B: {total_ab_saved:,} (비율 {actual_ratio:.1%})", 1)
 
     return {}
 
@@ -660,10 +685,6 @@ if __name__ == "__main__":
     import argparse
     from datautils import get_loaders
 
-    log_time("=" * 60)
-    log_time("Qwen3 2SSP + Double Sparse (AB분해 -> 2SSP -> ADMM)")
-    log_time("=" * 60)
-
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=str, help="Qwen3 model (e.g., Qwen/Qwen3-8B)")
     parser.add_argument("dataset", type=str, choices=["wikitext2", "ptb", "c4"], help="Calibration dataset")
@@ -673,6 +694,8 @@ if __name__ == "__main__":
                         help="Channel reduction ratio (0.5 = remove 50%% of channels)")
     parser.add_argument("--target-compression", type=float, default=None,
                         help="W 대비 A+B 저장 목표 압축률 (0.3 = 30%% 압축). 지정 시 channel-reduction 무시")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="err_prefin, time 등 상세 로그 출력")
     parser.add_argument("--minlayer", type=int, default=-1)
     parser.add_argument("--maxlayer", type=int, default=1000)
     parser.add_argument("--prune_only", type=str, default="",
@@ -683,11 +706,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    log_time(f"Model: {args.model}, Dataset: {args.dataset}")
+    log_section("설정")
+    log_time(f"모델: {args.model}, 데이터: {args.dataset}", 1)
     if args.target_compression is not None:
-        log_time(f"Target compression: {args.target_compression:.0%} (W 대비 A+B 저장)")
+        log_time(f"목표 압축: {args.target_compression:.0%}", 1)
     else:
-        log_time(f"Channel reduction: {args.channel_reduction}")
+        log_time(f"채널 reduction: {args.channel_reduction}", 1)
 
     if args.log_wandb and has_wandb:
         wandb.init(config=args)
@@ -695,7 +719,7 @@ if __name__ == "__main__":
     model = get_qwen3(args.model)
     model.eval()
 
-    log_time("Loading calibration data...")
+    log_time("캘리브레이션 데이터 로딩...", 1)
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=4096
     )
@@ -705,19 +729,19 @@ if __name__ == "__main__":
         model, dataloader, DEV,
         channel_reduction_ratio=args.channel_reduction,
         target_compression=args.target_compression,
+        verbose=args.verbose,
     )
-    log_time(f"Pruning completed in {time.time() - tick:.2f}s")
+    log_time(f"총 소요 시간: {time.time() - tick:.1f}s", 1)
 
     for dataset in ["wikitext2"]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=4096
         )
-        print("Dataset:", dataset)
+        log_time(f"평가: {dataset}", 1)
         qwen3_eval(model, testloader, DEV, dataset, args.log_wandb)
 
     if args.save:
-        log_time(f"Saving model to {args.save}")
+        log_time(f"모델 저장: {args.save}", 1)
         model.save_pretrained(args.save)
 
-    log_time("=" * 60)
-    log_time("Done!")
+    log_section("완료")

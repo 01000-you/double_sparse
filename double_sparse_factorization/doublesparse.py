@@ -73,7 +73,7 @@ def mag_prune(W, sp=0.6):
 def ent(p):
     return -(p * np.log2(p) + (1-p) * np.log2(1-p))
 
-def factorizeT(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None):
+def factorizeT(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None, verbose=True, name=""):
     #W = lx.weight.detach().T.float()
     if fixmask is None:
         nza = int(W.shape[0]**2 * asp)
@@ -102,17 +102,21 @@ def factorizeT(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None):
                 
         Bz, Bu = find_other2(Az, Wn, nzb, Bz, Bu, reg=1e-2, debug=False, rho_start=rho_start)
     
-    print(((Az != 0).sum() + (Bz != 0).sum()).item() / W.numel(), (Az != 0).sum().item() / Az.numel(),
-          (Bz != 0).sum().item() / Bz.numel(), Az.shape, Bz.shape,
-         (Az.numel()*ent((Az != 0).sum().item() / Az.numel()) + Bz.numel()*ent((Bz != 0).sum().item() / Bz.numel())) / W.numel(), 
-        ent(0.4), ent(0.5))
+    if verbose:
+        dens_ab = ((Az != 0).sum() + (Bz != 0).sum()).item() / W.numel()
+        dens_a = (Az != 0).sum().item() / Az.numel()
+        dens_b = (Bz != 0).sum().item() / Bz.numel()
+        ent_ab = (Az.numel()*ent(dens_a) + Bz.numel()*ent(dens_b)) / W.numel()
+        lbl = f" [{name}]" if name else ""
+        print(f"  [factorizeT]{lbl} A shape={Az.shape}, B shape={Bz.shape} | "
+              f"A density={dens_a:.3f}, B density={dens_b:.3f}, (A+B)/W={dens_ab:.3f} | entropy/W={ent_ab:.3f}")
     return ((Az / norm).matmul(Bz)).T, Bz.T, (Az / norm).T
 
 
-def factorizef(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None):
+def factorizef(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None, verbose=True, name=""):
     s_time = time.time()
     if W.shape[0] >= W.shape[1]:
-        return factorizeT(W.T, XX, asp, sp=sp, fixmask=fixmask)
+        return factorizeT(W.T, XX, asp, sp=sp, fixmask=fixmask, verbose=verbose, name=name)
     
     if fixmask is None:
         nza = int(W.shape[0]**2 * asp)
@@ -146,10 +150,14 @@ def factorizef(W, XX, asp=0.16, sp=0.4, iters=40, fixmask=None):
         #print_scores(Az.matmul(Bz / norm))
         
         
-    print(((Az != 0).sum() + (Bz != 0).sum()).item() / W.numel(), (Az != 0).sum().item() / Az.numel(),
-          (Bz != 0).sum().item() / Bz.numel(), Az.shape, Bz.shape,
-         (Az.numel()*ent((Az != 0).sum().item() / Az.numel()) + Bz.numel()*ent((Bz != 0).sum().item() / Bz.numel())) / W.numel(), 
-        ent(0.4), ent(0.5))
+    if verbose:
+        dens_ab = ((Az != 0).sum() + (Bz != 0).sum()).item() / W.numel()
+        dens_a = (Az != 0).sum().item() / Az.numel()
+        dens_b = (Bz != 0).sum().item() / Bz.numel()
+        ent_ab = (Az.numel()*ent(dens_a) + Bz.numel()*ent(dens_b)) / W.numel()
+        lbl = f" [{name}]" if name else ""
+        print(f"  [factorizef]{lbl} A shape={Az.shape}, B shape={Bz.shape} | "
+              f"A density={dens_a:.3f}, B density={dens_b:.3f}, (A+B)/W={dens_ab:.3f} | entropy/W={ent_ab:.3f}")
     return Az.matmul(Bz / norm), Az, Bz / norm
 
 def finalize(XXb, W, Ab, Bb):

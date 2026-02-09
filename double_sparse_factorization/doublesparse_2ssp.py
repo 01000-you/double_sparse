@@ -14,11 +14,12 @@ import numpy as np
 from doublesparse import find_other2, mag_prune, finalize, factorizef, factorizeT
 
 DEBUG = False
+VERBOSE = False  # True면 err_prefin, err_fin, time 등 상세 출력
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
-def initial_factorize(W, XX, iters=15):
+def initial_factorize(W, XX, iters=15, verbose=False, name=""):
     """
     Step 1: W를 AB로 초기 분해 (채널 제약 없음). sparsity 미사용, dense 분해.
     Returns: W_approx (= A @ B)
@@ -26,9 +27,9 @@ def initial_factorize(W, XX, iters=15):
     asp = 0.16 if W.shape[0] == W.shape[1] else 0.25
     sp = 1.0  # dense
     if W.shape[0] >= W.shape[1]:
-        W2, _, _ = factorizeT(W.T, XX, asp, sp=sp, iters=iters, fixmask=None)
+        W2, _, _ = factorizeT(W.T, XX, asp, sp=sp, iters=iters, fixmask=None, verbose=verbose, name=name)
         return W2.T
-    W2, _, _ = factorizef(W, XX, asp=asp, sp=sp, iters=iters, fixmask=None)
+    W2, _, _ = factorizef(W, XX, asp=asp, sp=sp, iters=iters, fixmask=None, verbose=verbose, name=name)
     return W2
 
 
@@ -88,12 +89,14 @@ def _factorizef_channel(W, XX, channel_keep_mask, asp, iters, nofinal):
         Bz = Bz * fixmask_B
     
     W2 = Az.matmul(Bz / norm)
-    print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
     if nofinal:
         return W2, Az.cpu(), (Bz / norm).cpu()
     Ac = finalize(XX, W, Az, Bz / norm)
     W3 = Ac.matmul(Bz / norm)
-    print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
     return W3, Ac.cpu(), (Bz / norm).cpu()
 
 
@@ -126,12 +129,14 @@ def _factorize_in_channel(W, XX, channel_keep_mask, asp, iters, nofinal):
         Bz = Bz * fixmask_B
 
     W2 = Az.matmul(Bz / norm)
-    print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
     if nofinal:
         return W2, Az.cpu(), (Bz / norm).cpu()
     Ac = finalize(XX, W, Az, Bz / norm)
     W3 = Ac.matmul(Bz / norm)
-    print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
     return W3, Ac.cpu(), (Bz / norm).cpu()
 
 
@@ -163,12 +168,14 @@ def _factorizeT_channel(W, XX, channel_keep_mask, asp, iters, nofinal):
         Bz = Bz * fixmask_B
     
     W2 = (Az / norm).matmul(Bz)
-    print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_prefin", (W2 - W).matmul(XX).matmul((W2 - W).T).diag().sum().item())
     if nofinal:
         return W2, (Az / norm).cpu(), Bz.cpu()
     Ac = finalize(XX, W, (Az / norm).T, Bz)
     W3 = Ac.matmul(Bz)
-    print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
+    if VERBOSE:
+        print("err_fin   ", (W3 - W).matmul(XX).matmul((W3 - W).T).diag().sum().item())
     return W3, Ac.cpu(), Bz.cpu()
 
 
@@ -215,7 +222,8 @@ class DoubleSparse2SSP:
             nofinal=self.nofinal, channel_dim=self.channel_dim
         )
         torch.cuda.synchronize()
-        print('time %.2f' % (time.time() - tick))
+        if VERBOSE:
+            print('time %.2f' % (time.time() - tick))
         self.layer.weight.data = W2.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
     def free(self):

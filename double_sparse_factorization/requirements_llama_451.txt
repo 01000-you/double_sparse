@@ -1,0 +1,5 @@
+# LLaMA Double Sparse (transformers 4.51.x)용 의존성
+torch>=2.0.0
+transformers>=4.51.2
+datasets
+numpy

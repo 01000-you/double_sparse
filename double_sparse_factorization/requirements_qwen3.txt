@@ -1,0 +1,6 @@
+# Qwen3 Double Sparse용 의존성
+# transformers 4.51.2가 Qwen3 지원 버전
+torch>=2.0.0
+transformers>=4.51.2
+datasets
+numpy

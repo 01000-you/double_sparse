@@ -120,34 +120,36 @@ def _compute_compression_stats(model, num_layers, hidden_size, intermediate_size
     return total_w, total_ab_saved
 
 
-def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
-                                  intermediate_size, hidden_size, seqlen, device):
+def _setup_mask_for_chunk(model, hidden_states, seqlen, device):
+    """Create attention_mask, position_embeddings etc for a chunk of hidden_states [1, seqlen, hidden]"""
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
+    cache_position = torch.arange(seqlen, device=device)
+    try:
+        from transformers.masking_utils import create_causal_mask
+    except ImportError:
+        from transformers.modeling_attn_mask_utils import create_causal_mask
+    mask_kwargs = {
+        "config": model.config,
+        "input_embeds": hidden_states,
+        "attention_mask": None,
+        "cache_position": cache_position,
+        "past_key_values": None,
+        "position_ids": position_ids,
+    }
+    causal_masks = create_causal_mask(**mask_kwargs)
+    if isinstance(causal_masks, dict):
+        attention_mask = causal_masks.get("full_attention", list(causal_masks.values())[0])
+    else:
+        attention_mask = causal_masks
+    return attention_mask, position_embeddings, position_ids, cache_position
+
+
+def _get_channel_importance_2ssp_lowmem(model, calibration_input_ids, num_layers,
+                                        intermediate_size, hidden_size, seqlen, device):
     """
-    2SSP: MLP hidden state L2 norm + Attention output L2 norm
-    Returns: (mlp_norms, attn_norms)
-    mlp_norms[layer_i] = [intermediate_size]
-    attn_norms[layer_i] = [hidden_size]  (q,k,v,o_proj 출력 norm)
+    레이어별 순차 forward로 OOM 방지. 전체 모델을 GPU에 올리지 않음.
     """
-    mlp_norms = {}
-    attn_norms = {}
-
-    def make_hook(store_dict, key):
-        def hook(module, input, output):
-            out = output[0] if isinstance(output, tuple) else output
-            out = out.detach().reshape(-1, out.size(-1))
-            if key not in store_dict:
-                store_dict[key] = []
-            store_dict[key].append(out)
-        return hook
-
-    hooks = []
-    for i in range(num_layers):
-        layer = model.model.layers[i]
-        layer.mlp.down_proj._2ssp_li = ("mlp", i)
-        for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            proj = getattr(layer.self_attn, name)
-            proj._2ssp_li = ("attn", i)
-
     mlp_store = {}
     attn_store = {}
 
@@ -166,30 +168,79 @@ def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
             attn_store[li] = []
         attn_store[li].append(out)
 
-    for i in range(num_layers):
-        hooks.append(model.model.layers[i].mlp.down_proj.register_forward_hook(mlp_hook))
-        for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            proj = getattr(model.model.layers[i].self_attn, name)
-            hooks.append(proj.register_forward_hook(attn_hook))
+    embed_tokens = model.model.embed_tokens.to(device)
+    layers = model.model.layers
+    has_sliding = getattr(model.model, "has_sliding_layers", False)
 
-    model.eval()
-    with torch.no_grad():
-        total_len = calibration_input_ids.size(1)
-        step = max(seqlen // 2, 1)
-        for i in range(0, total_len - seqlen + 1, step):
-            batch = calibration_input_ids[:, i : i + seqlen].to(device)
-            _ = model(batch)
+    total_len = calibration_input_ids.size(1)
+    step = max(seqlen // 2, 1)
+    chunk_starts = list(range(0, total_len - seqlen + 1, step))
 
-    for h in hooks:
-        h.remove()
+    for chunk_idx, start in enumerate(chunk_starts):
+        batch = calibration_input_ids[:, start : start + seqlen].to(device)
+        hidden = embed_tokens(batch)
+        attention_mask, position_embeddings, position_ids, cache_position = _setup_mask_for_chunk(
+            model, hidden, seqlen, device
+        )
+        if has_sliding:
+            try:
+                from transformers.masking_utils import create_sliding_window_causal_mask
+            except ImportError:
+                create_sliding_window_causal_mask = None
+            mask_kwargs = {
+                "config": model.config,
+                "input_embeds": hidden,
+                "attention_mask": None,
+                "cache_position": cache_position,
+                "past_key_values": None,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": attention_mask,
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs) if create_sliding_window_causal_mask else attention_mask,
+            }
+        else:
+            causal_mask_mapping = {"full_attention": attention_mask}
 
+        for layer_idx in range(num_layers):
+            layer = layers[layer_idx].to(device)
+            layer.mlp.down_proj._2ssp_li = ("mlp", layer_idx)
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                getattr(layer.self_attn, name)._2ssp_li = ("attn", layer_idx)
+
+            hooks = [
+                layer.mlp.down_proj.register_forward_hook(mlp_hook),
+            ]
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                hooks.append(getattr(layer.self_attn, name).register_forward_hook(attn_hook))
+
+            attn_type = getattr(layer, "attention_type", "full_attention")
+            mask = causal_mask_mapping.get(attn_type, attention_mask)
+            hidden = layer(
+                hidden,
+                attention_mask=mask,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                cache_position=cache_position,
+            )
+
+            for h in hooks:
+                h.remove()
+            layers[layer_idx] = layer.cpu()
+            del layer
+            torch.cuda.empty_cache()
+
+    embed_tokens.cpu()
+    torch.cuda.empty_cache()
+
+    mlp_norms = {}
+    attn_norms = {}
     for li in range(num_layers):
         if li in mlp_store:
             stacked = torch.cat(mlp_store[li], dim=0)
             mlp_norms[li] = stacked.norm(dim=0, p=2).to(device)
         else:
             mlp_norms[li] = torch.ones(intermediate_size, device=device)
-
         if li in attn_store:
             stacked = torch.cat(attn_store[li], dim=0)
             attn_norms[li] = stacked.norm(dim=0, p=2).to(device)
@@ -197,6 +248,18 @@ def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
             attn_norms[li] = torch.ones(hidden_size, device=device)
 
     return mlp_norms, attn_norms
+
+
+def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
+                                  intermediate_size, hidden_size, seqlen, device):
+    """
+    2SSP: MLP hidden state L2 norm + Attention output L2 norm
+    Returns: (mlp_norms, attn_norms)
+    """
+    return _get_channel_importance_2ssp_lowmem(
+        model, calibration_input_ids, num_layers,
+        intermediate_size, hidden_size, seqlen, device
+    )
 
 
 @torch.no_grad()
@@ -229,7 +292,13 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
-            self.module = module
+            object.__setattr__(self, "_wrapped_module", module)
+            # Forward key attributes from the wrapped module
+            if hasattr(module, "attention_type"):
+                object.__setattr__(self, "attention_type", module.attention_type)
+
+        def get_module(self):
+            return object.__getattribute__(self, "_wrapped_module")
 
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
@@ -240,6 +309,12 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
             cache["cache_position"] = kwargs.get("cache_position")
             raise ValueError
 
+        def __getattr__(self, name):
+            if name == "_wrapped_module" or name == "get_module":
+                raise AttributeError
+            module = object.__getattribute__(self, "_wrapped_module")
+            return getattr(module, name)
+
     layers[0] = Catcher(layers[0])
     calibration_batches = []
     for batch in dataloader:
@@ -248,7 +323,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
             model(batch[0].to(dev))
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers[0] = layers[0].get_module()
 
     if not calibration_batches:
         raise RuntimeError("No calibration data captured")
@@ -339,8 +414,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    log_time("Phase 2: 2SSP channel importance (model now uses A@B)...")
-    model = model.to(dev)
+    log_time("Phase 2: 2SSP channel importance (layer-by-layer, OOM 방지)...")
     mlp_norms, attn_norms = _get_channel_importance_2ssp(
         model, calibration_input_ids, num_layers,
         intermediate_size, hidden_size, seqlen, dev
@@ -352,6 +426,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
     log_time(f"Channel reduction: MLP {intermediate_size}->{num_keep_mlp}, Attn {hidden_size}->{num_keep_attn}")
 
     log_time("Phase 3: ADMM with channel mask...")
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
     inps = torch.zeros((args.nsamples, model.seqlen, hidden_size), dtype=dtype, device=dev)
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -359,7 +434,7 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, t
             model(batch[0].to(dev))
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers[0] = layers[0].get_module()
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
@@ -470,7 +545,13 @@ def qwen3_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
-            self.module = module
+            object.__setattr__(self, "_wrapped_module", module)
+            # Forward key attributes from the wrapped module
+            if hasattr(module, "attention_type"):
+                object.__setattr__(self, "attention_type", module.attention_type)
+
+        def get_module(self):
+            return object.__getattribute__(self, "_wrapped_module")
 
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
@@ -481,6 +562,12 @@ def qwen3_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
             cache["cache_position"] = kwargs.get("cache_position")
             raise ValueError
 
+        def __getattr__(self, name):
+            if name == "_wrapped_module" or name == "get_module":
+                raise AttributeError
+            module = object.__getattribute__(self, "_wrapped_module")
+            return getattr(module, name)
+
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
         batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
@@ -488,7 +575,7 @@ def qwen3_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
             model(batch)
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers[0] = layers[0].get_module()
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()

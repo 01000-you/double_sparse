@@ -15,6 +15,7 @@ from doublesparse_2ssp import (
     DoubleSparse2SSP,
     initial_factorize,
     get_channel_keep_mask,
+    compute_num_keep_from_target_compression,
 )
 from modelutils import find_layers, DEV
 
@@ -74,6 +75,49 @@ def _setup_position_embeddings(model, inps, dev):
     else:
         attention_mask = causal_masks
     return attention_mask, position_embeddings, position_ids, cache_position
+
+
+def _compute_compression_stats(model, num_layers, hidden_size, intermediate_size,
+                               num_keep_mlp, num_keep_attn, args):
+    """W 총 파라미터 vs A+B 저장 시 파라미터 (채널 마스크 적용 후)"""
+    total_w = 0
+    total_ab_saved = 0
+    keep_ratio_mlp = num_keep_mlp / intermediate_size
+    keep_ratio_attn = num_keep_attn / hidden_size
+
+    for i in range(num_layers):
+        if not (args.minlayer <= i < args.maxlayer):
+            continue
+        layer = model.model.layers[i]
+        full = find_layers(layer)
+
+        # MLP: up, gate (channel=intermediate), down (channel=intermediate)
+        for name in ["mlp.up_proj", "mlp.gate_proj", "mlp.down_proj"]:
+            if name not in full:
+                continue
+            if args.prune_only and args.prune_only not in name:
+                continue
+            w = full[name].weight
+            out, in_dim = w.shape[0], w.shape[1]
+            total_w += out * in_dim
+            if "down" in name:
+                ab = out * in_dim + in_dim * in_dim
+            else:
+                ab = out * out + out * in_dim
+            total_ab_saved += int(ab * keep_ratio_mlp)
+
+        # Attn: q,k,v,o_proj (channel=hidden)
+        for name in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]:
+            if name not in full:
+                continue
+            if args.prune_only and args.prune_only not in name:
+                continue
+            w = full[name].weight
+            h = w.shape[0]
+            total_w += h * h
+            total_ab_saved += int(2 * h * h * keep_ratio_attn)
+
+    return total_w, total_ab_saved
 
 
 def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
@@ -156,7 +200,7 @@ def _get_channel_importance_2ssp(model, calibration_input_ids, num_layers,
 
 
 @torch.no_grad()
-def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5):
+def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5, target_compression=None):
     """
     프로세스:
     1. W를 AB로 초기 분해 (채널 제약 없음)
@@ -222,8 +266,14 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5):
     )
 
     seqlen = min(2048, model.seqlen)
-    num_keep_mlp = max(1, int(intermediate_size * (1 - channel_reduction_ratio)))
-    num_keep_attn = max(1, int(hidden_size * (1 - channel_reduction_ratio)))
+    if target_compression is not None:
+        num_keep_mlp, num_keep_attn = compute_num_keep_from_target_compression(
+            target_compression, hidden_size, intermediate_size
+        )
+        log_time(f"Target compression {target_compression:.0%} -> num_keep MLP={num_keep_mlp}/{intermediate_size}, Attn={num_keep_attn}/{hidden_size}")
+    else:
+        num_keep_mlp = max(1, int(intermediate_size * (1 - channel_reduction_ratio)))
+        num_keep_attn = max(1, int(hidden_size * (1 - channel_reduction_ratio)))
 
     log_time("Phase 1: Initial AB factorization (all layers)...")
     outs = torch.zeros_like(inps)
@@ -388,6 +438,16 @@ def qwen3_sequential_2ssp(model, dataloader, dev, channel_reduction_ratio=0.5):
 
     model.config.use_cache = use_cache
     log_time("Pruning complete!")
+
+    # report actual compression (W vs A+B saved)
+    total_w, total_ab_saved = _compute_compression_stats(
+        model, num_layers, hidden_size, intermediate_size,
+        num_keep_mlp, num_keep_attn, args
+    )
+    if total_w > 0:
+        actual_ratio = total_ab_saved / total_w
+        log_time(f"[Compression] W total: {total_w:,} | A+B saved: {total_ab_saved:,} | ratio: {actual_ratio:.2%}")
+
     return {}
 
 
@@ -524,6 +584,8 @@ if __name__ == "__main__":
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--channel-reduction", type=float, default=0.5,
                         help="Channel reduction ratio (0.5 = remove 50%% of channels)")
+    parser.add_argument("--target-compression", type=float, default=None,
+                        help="W 대비 A+B 저장 목표 압축률 (0.3 = 30%% 압축). 지정 시 channel-reduction 무시")
     parser.add_argument("--minlayer", type=int, default=-1)
     parser.add_argument("--maxlayer", type=int, default=1000)
     parser.add_argument("--prune_only", type=str, default="",
@@ -535,7 +597,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     log_time(f"Model: {args.model}, Dataset: {args.dataset}")
-    log_time(f"Channel reduction: {args.channel_reduction}")
+    if args.target_compression is not None:
+        log_time(f"Target compression: {args.target_compression:.0%} (W 대비 A+B 저장)")
+    else:
+        log_time(f"Channel reduction: {args.channel_reduction}")
 
     if args.log_wandb and has_wandb:
         wandb.init(config=args)
@@ -552,6 +617,7 @@ if __name__ == "__main__":
     qwen3_sequential_2ssp(
         model, dataloader, DEV,
         channel_reduction_ratio=args.channel_reduction,
+        target_compression=args.target_compression,
     )
     log_time(f"Pruning completed in {time.time() - tick:.2f}s")
 

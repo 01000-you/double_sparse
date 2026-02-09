@@ -267,6 +267,22 @@ def compute_channel_importance_2ssp(model, calibration_batches, layer_indices, i
     return channel_norms
 
 
+def compute_num_keep_from_target_compression(target_compression, hidden_size, intermediate_size):
+    """
+    W 대비 (A+B) 저장 시 목표 압축률에 맞는 num_keep 계산.
+    target_compression=0.3: 30% 압축 → 저장 = 0.7*W
+    (A+B saved) = (1 - target_compression) * W
+    """
+    keep_ratio = 1.0 - target_compression
+    # MLP: up, gate, down 모두 channel=intermediate. W=3*h*im, A+B=3*(im²+im*h)
+    num_keep_mlp = max(1, int(
+        intermediate_size * keep_ratio * hidden_size / (intermediate_size + hidden_size)
+    ))
+    # Attn: W=4*h², A+B=8*h² per layer
+    num_keep_attn = max(1, int(hidden_size * keep_ratio * 0.5))
+    return num_keep_mlp, num_keep_attn
+
+
 def get_channel_keep_mask(channel_norms, num_keep):
     """상위 num_keep개 채널 유지 마스크"""
     _, top_indices = torch.topk(channel_norms, min(num_keep, channel_norms.numel()))
